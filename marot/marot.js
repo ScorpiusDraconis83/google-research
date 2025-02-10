@@ -1,4 +1,4 @@
-// Copyright 2023 The Google Research Authors.
+// Copyright 2024 The Google Research Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -858,6 +858,40 @@ class Marot {
   }
 
   /**
+   * Aggregates metrics info for this.data, collecting all metrics for a
+   * particular segment translation into the aggrDocSeg.metrics object in the
+   * metadata.segment field. Metric info is keyed by system.
+   */
+  addMetricSegmentAggregations() {
+    for (const doc of this.dataIter.docs) {
+      for (const docSegId of this.dataIter.docSegs[doc]) {
+        let aggrDocSegMetrics = {};
+        for (const system of this.dataIter.docSys[doc]) {
+          const range = this.dataIter.docSegSys[doc][docSegId][system].rows;
+          let aggrDocSegSysMetrics = {};
+          for (let rowId = range[0]; rowId < range[1]; rowId++) {
+            const parts = this.data[rowId];
+            const segment = parts[this.DATA_COL_METADATA].segment;
+            segment.aggrDocSeg.metrics = aggrDocSegMetrics;
+            if (segment.hasOwnProperty('metrics')) {
+              aggrDocSegSysMetrics = {
+                ...segment.metrics,
+                ...aggrDocSegSysMetrics,
+              };
+            }
+          }
+          for (let metric in aggrDocSegSysMetrics) {
+            if (!aggrDocSegMetrics.hasOwnProperty(metric)) {
+              aggrDocSegMetrics[metric] = {};
+            }
+            aggrDocSegMetrics[metric][system] = aggrDocSegSysMetrics[metric];
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * Aggregates this.data, collecting all data for a particular segment
    * translation (i.e., for a given (doc, docSegId) pair) into the aggrDocSeg
    * object in the metadata.segment field, adding to it the following
@@ -867,7 +901,6 @@ class Marot {
    *     the values being arrays of strings that are categories, severities,
    *     and <sev>[/<cat>], * respectively.
    *
-   *     Also added are aggrDocSeg.metrics[metric][system] values.
    * Makes sure that the metadata.segment object is common for each row from
    * the same doc+seg+sys.
    */
@@ -888,7 +921,6 @@ class Marot {
           sevsByRater: {},
           sevcatsBySystem: {},
           sevcatsByRater: {},
-          metrics: {},
           aggrDoc: aggrDoc,
         };
         for (const system of this.dataIter.docSys[doc]) {
@@ -898,17 +930,10 @@ class Marot {
             docSegId: docSegId,
             system: system,
             aggrDocSeg: aggrDocSeg,
-            metrics: {},
           };
           for (let rowId = range[0]; rowId < range[1]; rowId++) {
             const parts = this.data[rowId];
             const segment = parts[this.DATA_COL_METADATA].segment || {};
-            if (segment.hasOwnProperty('metrics')) {
-              aggrDocSegSys.metrics = {
-                ...segment.metrics,
-                ...aggrDocSegSys.metrics,
-              };
-            }
             aggrDocSegSys = {...segment, ...aggrDocSegSys};
             if (!aggrDocSegSys.hasOwnProperty('num_source_chars')) {
               aggrDocSegSys.num_source_chars = parts.num_source_chars;
@@ -916,12 +941,6 @@ class Marot {
             if (!aggrDocSegSys.hasOwnProperty('num_target_chars')) {
               aggrDocSegSys.num_target_chars = parts.num_target_chars;
             }
-          }
-          for (let metric in aggrDocSegSys.metrics) {
-            if (!aggrDocSeg.metrics.hasOwnProperty(metric)) {
-              aggrDocSeg.metrics[metric] = {};
-            }
-            aggrDocSeg.metrics[metric][system] = aggrDocSegSys.metrics[metric];
           }
           if (!aggrDocSegSys.source_tokens ||
               aggrDocSegSys.source_tokens.length == 0) {
@@ -1205,15 +1224,19 @@ class Marot {
   }
 
   /**
-   * This function will return false for segments that have some metric (MQM or
-   * other) only available for some of the systems, not all/none.
+   * This function will return false for segments that have some metric only
+   * available for some of the systems, not all/none. If MQM scores are present,
+   * non-MQM metrics are ignored for this check. Otherwise, all metrics are
+   * considered.
    * @param {!Object} metadata
    * @return {boolean}
    */
   allSystemsFilterPasses(metadata) {
     const segment = metadata.segment;
     const aggrDocSeg = segment.aggrDocSeg;
-    for (let metric in aggrDocSeg.metrics) {
+    const metrics =
+        'MQM' in aggrDocSeg.metrics ? ['MQM'] : Object.keys(aggrDocSeg.metrics);
+    for (const metric of metrics) {
       const numSystemsWithMetric =
           Object.keys(aggrDocSeg.metrics[metric]).length;
       if (numSystemsWithMetric > 0 &&
@@ -1685,7 +1708,7 @@ class Marot {
           continue;
         }
         metricDocAndDocSegs.add(
-            unitStats.doc, this.unitIdToDocSegId(unitStats.unit));
+            this.aColonB(unitStats.doc, this.unitIdToDocSegId(unitStats.unit)));
         metricStats.num_source_chars += unitStats.num_source_chars;
         metricStats.score += unitStats.metrics[metric];
       }
@@ -3646,7 +3669,10 @@ class Marot {
     if (metadata.prior_rater) {
       html += '<br><span">Prior rater: ' + metadata.prior_rater + '</span>\n';
     }
-    const prior_or_this_rater = metadata.prior_rater ?? rater;
+    let prior_or_this_rater = rater;
+    if (metadata.prior_rater) {
+      prior_or_this_rater = this.PRIOR_RATER_PREFIX + metadata.prior_rater;
+    }
     if (metadata.prior_error) {
       html += '<br><details><summary>Annotation from prior rater:</summary>' +
               '<div class="marot-prior-error">' +
@@ -3661,8 +3687,13 @@ class Marot {
         const de = metadata.deleted_errors[x];
         html += '<tr><td><span class="marot-deleted-index">' +
                 (x + 1) + '.</span></td><td>';
+        let deleted_error_prior_or_this_rater = prior_or_this_rater;
+        if (de.metadata.prior_rater) {
+          deleted_error_prior_or_this_rater =
+              this.PRIOR_RATER_PREFIX + de.metadata.prior_rater;
+        }
         html += this.rawErrorHTML(
-            de, de.metadata.prior_rater ?? prior_or_this_rater);
+            de, deleted_error_prior_or_this_rater);
         html += '</td></tr>';
       }
       html += '</table></details>\n';
@@ -4187,6 +4218,35 @@ class Marot {
   }
 
   /**
+   * Escapes HTML to safely render as text.
+   * @param {string} unescapedHtml
+   * @return {string}
+   */
+  escapeHtml(unescapedHtml) {
+    const div = document.createElement('div');
+    div.innerText = unescapedHtml;
+    return div.innerHTML;
+  }
+
+  /**
+   * Escapes regular expressions so the contents are matched literally.
+   * @param {string} unescapedRegex
+   * @return {string}
+   */
+  escapeRegex(unescapedRegex) {
+    return unescapedRegex.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  /**
+   * Convenience function to escape html in each token.
+   * @param {!Array<string>} tokens
+   * @return {!Array<string>}
+   */
+  escapeHtmlInTokens(tokens) {
+    return tokens.map(token => this.escapeHtml(token));
+  }
+
+  /**
    * Shows the segment data according to the current filters.
    * @param {?Object=} viewingConstraints Optional dict of doc:seg or
    *     doc:sys:seg to view. When not null, only these segments are shown.
@@ -4272,8 +4332,10 @@ class Marot {
               segmentMetadata = metadata.segment;
               scoringUnits = this.getScoringUnits(segmentMetadata);
               /** Copy source/target tokens as we'll wrap them in spans. */
-              sourceTokens = segmentMetadata.source_tokens.slice();
-              targetTokens = segmentMetadata.target_tokens.slice();
+              sourceTokens = this.escapeHtmlInTokens(
+                  segmentMetadata.source_tokens.slice());
+              targetTokens = this.escapeHtmlInTokens(
+                  segmentMetadata.target_tokens.slice());
               sourceSents = segmentMetadata.source_sentence_splits;
               targetSents = segmentMetadata.target_sentence_splits;
             }
@@ -4346,7 +4408,8 @@ class Marot {
               refRowHTML += '<td><div>' + doc + '</div></td>';
               refRowHTML += '<td><div>' + docSegId + '</div></td>';
               refRowHTML += '<td><div><b>Ref</b>: ' + ref + '</div></td>';
-              const sourceTokensForRef = aggrDocSeg.source_tokens || [];
+              const sourceTokensForRef =
+                  this.escapeHtmlInTokens(aggrDocSeg.source_tokens || []);
               const sourceHashKey = 'src';
               const sourceAlignmentStruct = this.getAlignmentStruct(
                   docsegHashKey, sourceHashKey, sourceSents);
@@ -4355,7 +4418,8 @@ class Marot {
                       sourceTokensForRef, sourceAlignmentStruct,
                       docsegHashKey, sourceHashKey) +
                   '</div></td>';
-              const refTokens = aggrDocSeg.reference_tokens[ref] ?? [];
+              const refTokens = this.escapeHtmlInTokens(
+                  aggrDocSeg.reference_tokens[ref] ?? []);
               const refSents = aggrDocSeg.reference_sentence_splits[ref] ?? [];
               const refHashKey = 'ref-' + MarotUtils.javaHashKey(ref);
               const refAlignmentStruct = this.getAlignmentStruct(
@@ -4577,7 +4641,7 @@ class Marot {
         const v = document.getElementById(`marot-val-${rowId}-${col}`);
         if (!v) continue;
         v.addEventListener('click', (e) => {
-          filter.value = '^' + parts[col] + '$';
+          filter.value = '^' + this.escapeRegex(parts[col]) + '$';
           this.show();
         });
       }
@@ -4853,8 +4917,10 @@ class Marot {
                 statsBySystem[system][doc][unit], 0, category, severity, 0);
           }
           if (aggrDocSegSys) {
+            const allSegUnitStats = scoringUnits.map(
+                scoringUnit => statsBySystem[system][doc][scoringUnit.unit]);
             const allUnitStats = this.getUnitStatsAsArray(
-                statsBySystem[system]);
+                {doc: allSegUnitStats});
             const aggrScores = this.aggregateUnitStats(allUnitStats);
             for (const mqm in aggrScores.mqmStats) {
               const mqmStats = aggrScores.mqmStats[mqm];
@@ -4867,6 +4933,11 @@ class Marot {
                 const currUnitStatsBySys = statsBySystem[system][doc][unit];
                 const aggrUnitScores = this.aggregateUnitStats(
                     [currUnitStatsBySys]);
+                if (!aggrUnitScores.mqmStats.hasOwnProperty(mqm)) {
+                  // This generally means that we have an AutoMQM rating but no
+                  // human rating.
+                  continue;
+                }
                 const aggrUnitMQMStats = aggrUnitScores.mqmStats[mqm];
                 aggrDocSegSys.metricsByUnit[unit] = {
                   ...aggrDocSegSys.metricsByUnit[unit],
@@ -4963,7 +5034,8 @@ class Marot {
       let html = '<option value=""></option>\n';
       for (let o in opt) {
         if (!o) continue;
-        html += `<option value="^${o}$">${o}</option>\n`;
+        const escapedValue = this.escapeRegex(o);
+        html += `<option value="^${escapedValue}$">${o}</option>\n`;
       }
       sel.innerHTML = html;
     }
@@ -5248,6 +5320,7 @@ class Marot {
       this.addSegmentAggregations();
       this.setSelectOptions();
       this.recomputeMQM();
+      this.addMetricSegmentAggregations();
       this.show();
     }
   }
@@ -5404,6 +5477,11 @@ class Marot {
      */
     const data = [];
     const FAKE_FIELD = '--marot-FAKE-FIELD--';
+    // Export the lowest-index MQM-like metric. If MQM itself is visible, it
+    // will be chosen as it always has index 0. Otherwise, this will generally
+    // be an AutoMQM metric for which scores are present.
+    const firstMqmMetricIndex = Math.min(this.mqmMetricsVisible);
+    const metricToSave = this.metrics[firstMqmMetricIndex];
     if (aggregation == 'system') {
       for (let system in this.statsBySystem) {
         if (system == this.TOTAL) {
@@ -5413,7 +5491,8 @@ class Marot {
         const aggregate = this.aggregateUnitStats(unitStats);
         const dataRow = Array(this.DATA_COL_NUM_PARTS).fill(FAKE_FIELD);
         dataRow[this.DATA_COL_SYSTEM] = system;
-        dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+        dataRow[this.DATA_COL_METADATA] =
+            aggregate.mqmStats[metricToSave].score;
         data.push(dataRow);
       }
     } else if (aggregation == 'document') {
@@ -5429,7 +5508,8 @@ class Marot {
           const dataRow = Array(this.DATA_COL_NUM_PARTS).fill(FAKE_FIELD);
           dataRow[this.DATA_COL_SYSTEM] = system;
           dataRow[this.DATA_COL_DOC] = doc;
-          dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+          dataRow[this.DATA_COL_METADATA] =
+              aggregate.mqmStats[metricToSave].score;
           data.push(dataRow);
         }
       }
@@ -5450,7 +5530,8 @@ class Marot {
             dataRow[this.DATA_COL_SYSTEM] = system;
             dataRow[this.DATA_COL_DOC] = doc;
             dataRow[this.DATA_COL_DOC_SEG_ID] = seg;
-            dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+            dataRow[this.DATA_COL_METADATA] =
+                aggregate.mqmStats[metricToSave].score;
             data.push(dataRow);
           }
         }
@@ -5470,7 +5551,8 @@ class Marot {
               dataRow[this.DATA_COL_DOC] = doc;
               dataRow[this.DATA_COL_DOC_SEG_ID] = seg;
               dataRow[this.DATA_COL_RATER] = rater;
-              dataRow[this.DATA_COL_METADATA] = aggregate.mqmStats.score;
+              dataRow[this.DATA_COL_METADATA] =
+                  aggregate.mqmStats[metricToSave].score;
               data.push(dataRow);
             }
           }

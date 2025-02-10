@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2023 The Google Research Authors.
+# Copyright 2024 The Google Research Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -89,6 +89,7 @@ class Params(object):
     self.use_one_step = True
     self.data_stride = 1
     self.cond_shape = ()
+    self.cond_audio_shape = ()
 
     # will be updated by update_flags()
     self.window_stride_samples = None

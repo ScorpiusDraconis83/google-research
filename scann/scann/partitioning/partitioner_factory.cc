@@ -1,4 +1,4 @@
-// Copyright 2023 The Google Research Authors.
+// Copyright 2024 The Google Research Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,78 +27,35 @@
 #include "absl/time/time.h"
 #include "scann/distance_measures/distance_measure_factory.h"
 #include "scann/oss_wrappers/scann_random.h"
+#include "scann/oss_wrappers/scann_status.h"
 #include "scann/partitioning/kmeans_tree_partitioner.pb.h"
 #include "scann/partitioning/kmeans_tree_partitioner_utils.h"
 #include "scann/partitioning/partitioner.pb.h"
+#include "scann/partitioning/partitioner_base.h"
+#include "scann/partitioning/partitioner_factory_base.h"
 #include "scann/partitioning/projecting_decorator.h"
+#include "scann/partitioning/tree_brute_force_second_level_wrapper.h"
 #include "scann/projection/projection_base.h"
 #include "scann/projection/projection_factory.h"
 #include "scann/proto/distance_measure.pb.h"
 #include "scann/proto/partitioning.pb.h"
+#include "scann/utils/common.h"
 #include "scann/utils/types.h"
 #include "scann/utils/weak_ptr_cache.h"
-#include "tensorflow/core/lib/core/errors.h"
 
 namespace research_scann {
 
+namespace {
 template <typename T>
-StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromSerializedImpl(
-    const SerializedPartitioner& proto, const PartitioningConfig& config) {
-  const int32_t n_fields_populated =
-      proto.has_kmeans() + proto.has_linear_projection();
-  if (n_fields_populated != 1) {
-    return InvalidArgumentError(
-        "SerializedPartitioner must have exactly one subproto field "
-        "populated.");
-  }
-
-  StatusOr<unique_ptr<Partitioner<T>>> result;
-  if (proto.has_kmeans()) {
-    auto kmeans_tree =
-        std::make_shared<KMeansTree>(proto.kmeans().kmeans_tree());
-    return PartitionerFromKMeansTree<T>(std::move(kmeans_tree), config);
-  } else if (proto.has_linear_projection()) {
-    return InternalError("Linear projection tree partitioners not supported.");
-  }
-
-  return InternalError("CAN'T HAPPEN.");
-}
-
-template <typename T>
-StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromSerialized(
-    const SerializedPartitioner& proto, const PartitioningConfig& config,
-    int32_t projection_seed_offset) {
-  if (proto.uses_projection() && !config.has_projection()) {
-    return InvalidArgumentError(
-        "Serialized partitioner uses projection but PartitioningConfig lacks a "
-        "projection subproto.");
-  }
-
-  if (!config.has_projection()) {
-    return PartitionerFromSerializedImpl<T>(proto, config);
-  }
-
-  TF_ASSIGN_OR_RETURN(
-      auto projection,
-      ProjectionFactory<T>(config.projection(), projection_seed_offset));
-
-  TF_ASSIGN_OR_RETURN(auto partitioner,
-                      PartitionerFromSerializedImpl<double>(proto, config));
-
-  return MakeProjectingDecorator<T, double>(std::move(projection),
-                                            std::move(partitioner));
-}
-
-template <typename T>
-StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTree(
-    shared_ptr<const KMeansTree> kmeans_tree,
-    const PartitioningConfig& config) {
-  TF_ASSIGN_OR_RETURN(auto training_dist,
-                      GetDistanceMeasure(config.partitioning_distance()));
+StatusOr<unique_ptr<KMeansTreePartitioner<T>>>
+PartitionerFromKMeansTreeNoProjection(shared_ptr<const KMeansTree> kmeans_tree,
+                                      const PartitioningConfig& config) {
+  SCANN_ASSIGN_OR_RETURN(auto training_dist,
+                         GetDistanceMeasure(config.partitioning_distance()));
 
   shared_ptr<const DistanceMeasure> database_tokenization_dist;
   if (config.has_database_tokenization_distance_override()) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         database_tokenization_dist,
         GetDistanceMeasure(config.database_tokenization_distance_override()));
   } else {
@@ -107,7 +64,7 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTree(
 
   shared_ptr<const DistanceMeasure> query_tokenization_dist;
   if (config.has_query_tokenization_distance_override()) {
-    TF_ASSIGN_OR_RETURN(
+    SCANN_ASSIGN_OR_RETURN(
         query_tokenization_dist,
         GetDistanceMeasure(config.query_tokenization_distance_override()));
   } else {
@@ -128,6 +85,10 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTree(
       DatabaseSpillingConfig::FIXED_NUMBER_OF_CENTERS) {
     km->set_database_spilling_fixed_number_of_centers(
         config.database_spilling().max_spill_centers());
+  } else if (config.database_spilling().spilling_type() ==
+             DatabaseSpillingConfig::TWO_CENTER_ORTHOGONALITY_AMPLIFIED) {
+    km->set_orthogonality_amplification_lambda(
+        config.database_spilling().orthogonality_amplification_lambda());
   }
   if (config.query_tokenization_type() == PartitioningConfig::FLOAT) {
     km->SetQueryTokenizationType(KMeansTreePartitioner<T>::FLOAT);
@@ -154,8 +115,87 @@ StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTree(
     km->SetDatabaseTokenizationType(
         research_scann::KMeansTreePartitioner<T>::ASYMMETRIC_HASHING);
   }
+  km->SetNumTokenizedBranch(config.num_tokenized_branch());
+  return km;
+}
+}  // namespace
 
-  return StatusOr<unique_ptr<Partitioner<T>>>(std::move(km));
+template <typename T>
+StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromSerializedImpl(
+    const SerializedPartitioner& proto, const PartitioningConfig& config) {
+  const int32_t n_fields_populated =
+      proto.has_kmeans() + proto.has_linear_projection();
+  if (n_fields_populated != 1) {
+    return InvalidArgumentError(
+        "SerializedPartitioner must have exactly one subproto field "
+        "populated.");
+  }
+
+  if (proto.has_kmeans()) {
+    auto kmeans_tree =
+        std::make_shared<KMeansTree>(proto.kmeans().kmeans_tree());
+    SCANN_ASSIGN_OR_RETURN(auto partitioner,
+                           PartitionerFromKMeansTreeNoProjection<T>(
+                               std::move(kmeans_tree), config));
+    if (config.bottom_up_top_level_partitioner().enabled() &&
+        proto.kmeans().has_next_bottom_up_level()) {
+      LOG(INFO) << "Deserializing top level partitioners.";
+      auto wrapper = make_unique<TreeBruteForceSecondLevelWrapper<T>>(
+          std::move(partitioner));
+      SCANN_RETURN_IF_ERROR(
+          wrapper->CreatePartitioning(config.bottom_up_top_level_partitioner(),
+                                      proto.kmeans().next_bottom_up_level()));
+      return wrapper;
+    } else {
+      return partitioner;
+    }
+  } else if (proto.has_linear_projection()) {
+    return InternalError("Linear projection tree partitioners not supported.");
+  }
+
+  return InternalError("CAN'T HAPPEN.");
+}
+
+template <typename T>
+StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromSerialized(
+    const SerializedPartitioner& proto, const PartitioningConfig& config,
+    int32_t projection_seed_offset) {
+  if (proto.uses_projection() && !config.has_projection()) {
+    return InvalidArgumentError(
+        "Serialized partitioner uses projection but PartitioningConfig lacks a "
+        "projection subproto.");
+  }
+
+  if (!config.has_projection()) {
+    return PartitionerFromSerializedImpl<T>(proto, config);
+  }
+
+  unique_ptr<Projection<T>> projection;
+  SCANN_ASSIGN_OR_RETURN(
+      projection,
+      ProjectionFactory<T>(config.projection(), projection_seed_offset));
+
+  SCANN_ASSIGN_OR_RETURN(auto partitioner,
+                         PartitionerFromSerializedImpl<float>(proto, config));
+
+  return MakeProjectingDecorator<T>(std::move(projection),
+                                    std::move(partitioner));
+}
+
+template <typename T>
+StatusOr<unique_ptr<Partitioner<T>>> PartitionerFromKMeansTree(
+    shared_ptr<const KMeansTree> kmeans_tree,
+    const PartitioningConfig& config) {
+  if (!config.has_projection()) {
+    return PartitionerFromKMeansTreeNoProjection<T>(kmeans_tree, config);
+  }
+  SCANN_ASSIGN_OR_RETURN(
+      auto partitioner,
+      PartitionerFromKMeansTreeNoProjection<float>(kmeans_tree, config));
+  SCANN_ASSIGN_OR_RETURN(auto projection,
+                         ProjectionFactory<T>(config.projection()));
+  return MakeProjectingDecorator<T>(std::move(projection),
+                                    std::move(partitioner));
 }
 
 SCANN_INSTANTIATE_SERIALIZED_PARTITIONER_FACTORY(, int8_t);
